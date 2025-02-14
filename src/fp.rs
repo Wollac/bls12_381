@@ -6,12 +6,25 @@ use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
-use crate::util::{adc, mac, sbb};
+use crate::util::{adc, sbb};
+
+#[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
+use crate::util::mac;
+
+#[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+use risc0_bigint2::field;
 
 // The internal representation of this type is six 64-bit unsigned
 // integers in little-endian order. `Fp` values are always in
 // Montgomery form; i.e., Scalar(a) = aR mod p, with R = 2^384.
+#[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
 #[derive(Copy, Clone)]
+pub struct Fp(pub(crate) [u64; 6]);
+
+// RISCZero patch
+#[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub struct Fp(pub(crate) [u64; 6]);
 
 impl fmt::Debug for Fp {
@@ -67,7 +80,7 @@ impl ConditionallySelectable for Fp {
 }
 
 /// p = 4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787
-const MODULUS: [u64; 6] = [
+pub const MODULUS: [u64; 6] = [
     0xb9fe_ffff_ffff_aaab,
     0x1eab_fffe_b153_ffff,
     0x6730_d2a0_f6b0_f624,
@@ -76,7 +89,24 @@ const MODULUS: [u64; 6] = [
     0x1a01_11ea_397f_e69a,
 ];
 
+#[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+pub const MODULUS_SQR: [u64; 12] = [
+    0x26aa_0000_1c71_8e39,
+    0x7ced_6b1d_7638_2eab,
+    0x162c_3383_6211_3cfd,
+    0x66bf_91ed_3e71_b743,
+    0x292e_85a8_7091_a049,
+    0x1d68_619c_8618_5c7b,
+    0xf531_4933_0978_ef01,
+    0x50a6_2cfd_16dd_ca6e,
+    0x66e5_9e49_349e_8bd0,
+    0xe2dc_90e5_0e70_46b4,
+    0x4bd2_78ea_a22f_25e9,
+    0x02a4_37a4_b8c3_5fc7,
+];
+
 /// INV = -(p^{-1} mod 2^64) mod 2^64
+#[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
 const INV: u64 = 0x89f3_fffc_fffc_fffd;
 
 /// R = 2^384 mod p
@@ -100,6 +130,7 @@ const R2: Fp = Fp([
 ]);
 
 /// R3 = 2^(384*3) mod p
+#[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
 const R3: Fp = Fp([
     0xed48_ac6b_d94c_a1e0,
     0x315f_831e_03a7_adf8,
@@ -165,9 +196,17 @@ impl Fp {
     }
 
     /// Returns one, the multiplicative identity.
+    #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
     #[inline]
     pub const fn one() -> Fp {
         R
+    }
+
+    /// RISCZero patch: non-Montgomery
+    #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+    #[inline]
+    pub const fn one() -> Fp {
+        Fp([1, 0, 0, 0, 0, 0])
     }
 
     pub fn is_zero(&self) -> Choice {
@@ -201,7 +240,10 @@ impl Fp {
 
         // Convert to Montgomery form by computing
         // (a.R^0 * R^2) / R = a.R
-        tmp *= &R2;
+        #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
+        {
+            tmp *= &R2;
+        }
 
         CtOption::new(tmp, Choice::from(is_some))
     }
@@ -211,9 +253,14 @@ impl Fp {
     pub fn to_bytes(self) -> [u8; 48] {
         // Turn into canonical form by computing
         // (a.R) / R = a
+
+        #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
         let tmp = Fp::montgomery_reduce(
             self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5], 0, 0, 0, 0, 0, 0,
         );
+
+        #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+        let tmp = self;
 
         let mut res = [0; 48];
         res[0..8].copy_from_slice(&tmp.0[5].to_be_bytes());
@@ -264,8 +311,13 @@ impl Fp {
         // constant `R2` or `R3`.
         let d1 = Fp([limbs[11], limbs[10], limbs[9], limbs[8], limbs[7], limbs[6]]);
         let d0 = Fp([limbs[5], limbs[4], limbs[3], limbs[2], limbs[1], limbs[0]]);
+
         // Convert to Montgomery form
-        d0 * R2 + d1 * R3
+        #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
+        return d0 * R2 + d1 * R3;
+
+        #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))] //TODO: untested
+        return d0 * R + d1 * R2;
     }
 
     /// Returns whether or not this element is strictly lexicographically
@@ -277,9 +329,13 @@ impl Fp {
         // (p - 1) // 2.
 
         // First, because self is in Montgomery form we need to reduce it
+        #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
         let tmp = Fp::montgomery_reduce(
             self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5], 0, 0, 0, 0, 0, 0,
         );
+
+        #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+        let tmp = self;
 
         let (_, borrow) = sbb(tmp.0[0], 0xdcff_7fff_ffff_d556, 0);
         let (_, borrow) = sbb(tmp.0[1], 0x0f55_ffff_58a9_ffff, borrow);
@@ -343,6 +399,7 @@ impl Fp {
     /// Computes the multiplicative inverse of this field
     /// element, returning None in the case that this element
     /// is zero.
+    #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
     pub fn invert(&self) -> CtOption<Self> {
         // Exponentiate by p - 2
         let t = self.pow_vartime(&[
@@ -355,6 +412,19 @@ impl Fp {
         ]);
 
         CtOption::new(t, !self.is_zero())
+    }
+
+    #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+    pub fn invert(&self) -> CtOption<Self> {
+        if self.is_zero().into() {
+            return CtOption::new(Fp::zero(), Choice::from(0u8));
+        }
+        let mut result = [0u32; 12];
+        let lhs: &[u32; 12] = &bytemuck::cast_ref(&self.0);
+        let prime: &[u32; 12] = &bytemuck::cast_ref(&MODULUS);
+        field::modinv_384(lhs, prime, &mut result);
+        let ret: [u64; 6] = bytemuck::cast(result);
+        CtOption::new(Fp(ret), Choice::from(1u8))
     }
 
     #[inline]
@@ -392,6 +462,18 @@ impl Fp {
         (&Fp([d0, d1, d2, d3, d4, d5])).subtract_p()
     }
 
+    #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+    #[inline]
+    pub fn add_zkvm(&self, rhs: &Fp) -> Fp {
+        let mut result = [0u32; 12];
+        let lhs: &[u32; 12] = bytemuck::cast_ref(&self.0);
+        let rhs: &[u32; 12] = bytemuck::cast_ref(&rhs.0);
+        let prime: &[u32; 12] = bytemuck::cast_ref(&MODULUS);
+        field::modadd_384(lhs, rhs, prime, &mut result);
+        let ret: [u64; 6] = bytemuck::cast(result);
+        Fp(ret)
+    }
+
     #[inline]
     pub const fn neg(&self) -> Fp {
         let (d0, borrow) = sbb(MODULUS[0], self.0[0], 0);
@@ -417,15 +499,29 @@ impl Fp {
         ])
     }
 
+    #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
     #[inline]
     pub const fn sub(&self, rhs: &Fp) -> Fp {
         (&rhs.neg()).add(self)
+    }
+
+    #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+    #[inline]
+    pub fn sub(&self, rhs: &Fp) -> Fp {
+        let mut result = [0u32; 12];
+        let lhs: &[u32; 12] = bytemuck::cast_ref(&self.0);
+        let rhs: &[u32; 12] = bytemuck::cast_ref(&rhs.0);
+        let prime: &[u32; 12] = bytemuck::cast_ref(&MODULUS);
+        field::modsub_384(lhs, rhs, prime, &mut result);
+        let ret: [u64; 6] = bytemuck::cast(result);
+        Fp(ret)
     }
 
     /// Returns `c = a.zip(b).fold(0, |acc, (a_i, b_i)| acc + a_i * b_i)`.
     ///
     /// Implements Algorithm 2 from Patrick Longa's
     /// [ePrint 2022-367](https://eprint.iacr.org/2022/367) §3.
+    #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
     #[inline]
     pub(crate) fn sum_of_products<const T: usize>(a: [Fp; T], b: [Fp; T]) -> Fp {
         // For a single `a x b` multiplication, operand scanning (schoolbook) takes each
@@ -477,12 +573,37 @@ impl Fp {
 
                 (r1, r2, r3, r4, r5, r6)
             });
-
         // Because we represent F_p elements in non-redundant form, we need a final
         // conditional subtraction to ensure the output is in range.
         (&Fp([u0, u1, u2, u3, u4, u5])).subtract_p()
     }
 
+    /// RISCZero patch (sum_of_two_products already replaced by deg2 patch)
+    #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+    #[inline]
+    pub(crate) fn sum_of_six_products(
+        a0: &Fp,
+        a1: &Fp,
+        a2: &Fp,
+        a3: &Fp,
+        a4: &Fp,
+        a5: &Fp,
+        b0: &Fp,
+        b1: &Fp,
+        b2: &Fp,
+        b3: &Fp,
+        b4: &Fp,
+        b5: &Fp,
+    ) -> Fp {
+        (a0 * b0)
+            .add_zkvm(&(a1 * b1))
+            .add_zkvm(&(a2 * b2))
+            .add_zkvm(&(a3 * b3))
+            .add_zkvm(&(a4 * b4))
+            .add_zkvm(&(a5 * b5))
+    }
+
+    #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
     #[inline(always)]
     pub(crate) const fn montgomery_reduce(
         t0: u64,
@@ -561,6 +682,7 @@ impl Fp {
         (&Fp([r6, r7, r8, r9, r10, r11])).subtract_p()
     }
 
+    #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
     #[inline]
     pub const fn mul(&self, rhs: &Fp) -> Fp {
         let (t0, carry) = mac(0, self.0[0], rhs.0[0], 0);
@@ -608,7 +730,21 @@ impl Fp {
         Self::montgomery_reduce(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11)
     }
 
+    /// RISCZero patch
+    #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+    #[inline]
+    pub fn mul(&self, rhs: &Fp) -> Fp {
+        let mut result = [0u32; 12];
+        let lhs: &[u32; 12] = bytemuck::cast_ref(&self.0);
+        let rhs: &[u32; 12] = bytemuck::cast_ref(&rhs.0);
+        let prime: &[u32; 12] = bytemuck::cast_ref(&MODULUS);
+        field::modmul_384(lhs, rhs, prime, &mut result);
+        let ret: [u64; 6] = bytemuck::cast(result);
+        Fp(ret)
+    }
+
     /// Squares this element.
+    #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
     #[inline]
     pub const fn square(&self) -> Self {
         let (t1, carry) = mac(0, self.0[0], self.0[1], 0);
@@ -657,6 +793,19 @@ impl Fp {
         let (t11, _) = adc(t11, 0, carry);
 
         Self::montgomery_reduce(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11)
+    }
+
+    /// RISCZero patch
+    #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
+    #[inline]
+    pub fn square(&self) -> Self {
+        // self * self
+        let mut result = [0u32; 12];
+        let lhs: &[u32; 12] = bytemuck::cast_ref(&self.0);
+        let prime: &[u32; 12] = bytemuck::cast_ref(&MODULUS);
+        field::modmul_384(lhs, lhs, prime, &mut result);
+        let ret: [u64; 6] = bytemuck::cast(result);
+        Fp(ret)
     }
 }
 
