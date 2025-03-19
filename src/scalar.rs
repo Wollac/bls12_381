@@ -537,7 +537,7 @@ impl Scalar {
     }
 
     #[inline(always)]
-    pub(crate) const fn montgomery_reduce(
+    const fn montgomery_reduce(
         r0: u64,
         r1: u64,
         r2: u64,
@@ -686,36 +686,6 @@ impl Scalar {
         let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3]) == 0) as u64).wrapping_sub(1);
 
         Scalar([d0 & mask, d1 & mask, d2 & mask, d3 & mask])
-    }
-
-    /// Divides 'self' by an integer.
-    #[inline]
-    pub fn divn(&self, mut n: u32) -> Scalar {
-        if n >= 256 {
-            return Scalar::from(0);
-        }
-
-        let mut out = *self;
-
-        while n >= 64 {
-            let mut t = 0;
-            for i in out.0.iter_mut().rev() {
-                core::mem::swap(&mut t, i);
-            }
-            n -= 64;
-        }
-
-        if n > 0 {
-            let mut t = 0;
-            for i in out.0.iter_mut().rev() {
-                let t2 = *i << (64 - n);
-                *i >>= n;
-                *i |= t;
-                t = t2;
-            }
-        }
-
-        out
     }
 }
 
